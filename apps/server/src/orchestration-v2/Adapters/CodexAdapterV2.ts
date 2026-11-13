@@ -1190,6 +1190,13 @@ function codexUsageLimitError(
   );
 }
 
+// Codex can briefly lose network permission mid-stream and fails the turn (openai/codex#54726).
+function codexTurnFailureIsTransient(code: string | null | undefined, message: string | undefined) {
+  return (
+    code === "serverOverloaded" || message?.includes("network permission was revoked") === true
+  );
+}
+
 /**
  * ChatGPT sharing reports its own reason inside Codex's generic turn error, so
  * the code it names replaces Codex's, and clients pick a recovery from it. Its
@@ -6950,8 +6957,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           },
         );
 
-        // Codex can end an overloaded turn without retry advice. Continue its
-        // persisted history with empty input instead of resending the user message.
+        // Codex can end an overloaded or transiently failed turn without retry advice.
+        // Continue its persisted history with empty input instead of resending the user message.
         const retryCapacityFailure = Effect.fn("CodexAdapterV2.retryCapacityFailure")(function* (
           terminal: Parameters<typeof finalizeCodexTurn>[0],
         ) {
@@ -6962,7 +6969,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               : codexErrorInfoCode(terminal.failureErrorInfo);
           if (
             terminal.status !== "failed" ||
-            code !== "serverOverloaded" ||
+            !codexTurnFailureIsTransient(
+              code,
+              terminal.failureMessage ?? context.latestProviderFailure?.nativeMessage,
+            ) ||
             context.subagent !== null ||
             (context.input.message.attachments.length === 0 &&
               context.input.message.text.trim().toLowerCase() === "/compact")
@@ -6992,7 +7002,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   terminal.failureMessage ??
                   context.latestProviderFailure?.nativeMessage ??
                   "Selected model is at capacity.",
-                nativeCode: code,
+                nativeCode: code ?? null,
                 failure: makeProviderFailure({
                   message:
                     context.latestProviderFailure?.failure.message ?? terminal.failureMessage,

@@ -4115,6 +4115,126 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect.each([
+    {
+      cause: "revoked network permission",
+      message: "Fatal error: application network permission was revoked",
+      retried: true,
+    },
+    { cause: "other fatal errors", message: "Fatal error: unknown", retried: false },
+  ] as const)("retries a failed Codex turn after $cause: $retried", ({ message, retried }) =>
+    Effect.gen(function* () {
+      const scenario = `fatal-retry-${retried}`;
+      const nativeThreadId = `native-${scenario}`;
+      const nativeTurnId = (attempt: number) => `${nativeThreadId}-${attempt}`;
+      const prompt = "Continue the task.";
+      const error = { message, codexErrorInfo: "other" };
+      const entries = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId: nativeTurnId(0),
+        prompt,
+      });
+      entries.push(
+        {
+          type: "emit_inbound",
+          frame: {
+            method: "error",
+            params: { threadId: nativeThreadId, turnId: nativeTurnId(0), willRetry: false, error },
+          },
+        },
+        {
+          type: "emit_inbound",
+          frame: {
+            method: "turn/completed",
+            params: {
+              threadId: nativeThreadId,
+              turn: { ...makeCodexReplayTurn({ id: nativeTurnId(0), status: "failed" }), error },
+            },
+          },
+        },
+      );
+      if (retried) {
+        const [, response, started] = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: nativeTurnId(1),
+          prompt,
+        }).slice(-3);
+        if (response === undefined || started === undefined) return;
+        entries.push(
+          {
+            type: "expect_outbound",
+            frame: {
+              id: 4,
+              method: "turn/start",
+              params: {
+                threadId: nativeThreadId,
+                input: [],
+                cwd: "/workspace",
+                model: "gpt-5.4",
+                approvalPolicy: "never",
+                approvalsReviewer: "user",
+                sandboxPolicy: { type: "dangerFullAccess" },
+                summary: "auto",
+                collaborationMode: { mode: "default", settings: { model: "gpt-5.4" } },
+              },
+            },
+          },
+          withReplayRequestId(response, 4),
+          started,
+          {
+            type: "emit_inbound",
+            frame: {
+              method: "turn/completed",
+              params: {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: nativeTurnId(1), status: "completed" }),
+              },
+            },
+          },
+        );
+      }
+      const retryItems = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({ scenario, entries }),
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "error" &&
+          event.turnItem.status === "running"
+            ? Queue.offer(retryItems, event)
+            : Effect.void,
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make(scenario),
+          text: prompt,
+        }),
+      );
+      if (retried) {
+        const retry = yield* Queue.take(retryItems);
+        assert.isTrue(retry.type === "turn_item.updated" && retry.turnItem.type === "error");
+        if (retry.type !== "turn_item.updated" || retry.turnItem.type !== "error") return;
+        assert.deepEqual(retry.turnItem.retry, { attempt: 1, maxAttempts: 5, retryDelayMs: 2_000 });
+        assert.isEmpty(harness.terminalEvents());
+        yield* TestClock.adjust(2_000);
+      }
+      yield* harness.awaitTerminal(1);
+      assert.equal(harness.terminalEvents()[0]?.status, retried ? "completed" : "failed");
+      assert.lengthOf(harness.terminalEvents(), 1);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
   it.effect("reports a thread another Codex client is writing to as in use", () =>
     Effect.gen(function* () {
       const nativeThreadId = "thread-open-elsewhere";
